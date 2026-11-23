@@ -1,0 +1,101 @@
+name: Run tasks and save outputs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'EmotionDetection/**'
+      - 'server.py'
+      - 'test_emotion_detection.py'
+      - '.github/workflows/outputs.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests flask pylint playwright
+      - name: Check Watson service
+        id: probe
+        run: |
+          mkdir -p outputs
+          code=$(curl -s -o outputs/probe_body.txt -w "%{http_code}" --max-time 20 -X POST \
+            "https://sn-watson-emotion.labs.skills.network/v1/watson.runtime.nlp.v1/NlpService/EmotionPredict" \
+            -H "grpc-metadata-mm-model-id: emotion_aggregated-workflow_lang_en_stock" \
+            -H "Content-Type: application/json" \
+            -d '{"raw_document":{"text":"I love this new technology"}}' || echo "000")
+          echo "$code" > outputs/probe_status.txt
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Watson status: $code"
+      - name: 8b static code analysis
+        run: |
+          { echo "\$ pylint server.py"; pylint server.py; } > outputs/8b_static_code_analysis 2>&1 || true
+          cat outputs/8b_static_code_analysis
+      - name: 2b, 3b, 4b interactive shell outputs
+        if: steps.probe.outputs.code == '200'
+        run: |
+          # Task 2 version of the function (returns the raw response text)
+          mkdir -p /tmp/task2 && cat > /tmp/task2/emotion_detection.py <<'PY'
+          import requests
+
+          def emotion_detector(text_to_analyse):
+              url = 'https://sn-watson-emotion.labs.skills.network/v1/watson.runtime.nlp.v1/NlpService/EmotionPredict'
+              myobj = { "raw_document": { "text": text_to_analyse } }
+              header = {"grpc-metadata-mm-model-id": "emotion_aggregated-workflow_lang_en_stock"}
+              response = requests.post(url, json = myobj, headers=header)
+              return response.text
+          PY
+          cd /tmp/task2 && printf 'from emotion_detection import emotion_detector\nemotion_detector("I love this new technology.")\nexit()\n' \
+            | script -q -c python3 /dev/null | tr -d '\r' > $GITHUB_WORKSPACE/outputs/2b_application_creation
+          # Task 3 version: formatted output, module at the project root
+          mkdir -p /tmp/task3 && cp $GITHUB_WORKSPACE/EmotionDetection/emotion_detection.py /tmp/task3/
+          cd /tmp/task3 && printf 'from emotion_detection import emotion_detector\nemotion_detector("I am so happy I am doing this")\nexit()\n' \
+            | script -q -c python3 /dev/null | tr -d '\r' > $GITHUB_WORKSPACE/outputs/3b_formatted_output_test
+          # Task 4: import from the EmotionDetection package
+          cd $GITHUB_WORKSPACE && printf 'from EmotionDetection.emotion_detection import emotion_detector\nemotion_detector("I hate working long hours")\nexit()\n' \
+            | script -q -c python3 /dev/null | tr -d '\r' > outputs/4b_packaging_test
+          cat outputs/2b_application_creation outputs/3b_formatted_output_test outputs/4b_packaging_test
+      - name: 5b unit tests
+        if: steps.probe.outputs.code == '200'
+        run: |
+          { echo "\$ python3 test_emotion_detection.py"; python3 test_emotion_detection.py; } > outputs/5b_unit_testing_result 2>&1 || true
+          cat outputs/5b_unit_testing_result
+      - name: 6b and 7c screenshots
+        if: steps.probe.outputs.code == '200'
+        run: |
+          python -m playwright install --with-deps chromium
+          nohup python3 server.py > server.log 2>&1 &
+          for i in $(seq 1 30); do curl -s http://localhost:5000/ > /dev/null && break; sleep 1; done
+          cat > /tmp/shots.py <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              pg = b.new_page(viewport={"width": 1280, "height": 720})
+              pg.goto("http://localhost:5000/")
+              pg.fill("#textToAnalyze", "I think I am having fun")
+              pg.click("button")
+              pg.wait_for_function("document.getElementById('system_response').innerText.length > 0", timeout=30000)
+              pg.screenshot(path="outputs/6b_deployment_test.png", full_page=True)
+              pg.goto("http://localhost:5000/")
+              pg.click("button")
+              pg.wait_for_function("document.getElementById('system_response').innerText.length > 0", timeout=30000)
+              pg.screenshot(path="outputs/7c_error_handling_interface.png", full_page=True)
+              b.close()
+          PY
+          python3 /tmp/shots.py
+          cat server.log
+      - name: Commit outputs
+        if: always()
+        run: |
+          git config user.name "Dareen Alalyani"
+          git config user.email "dareen-ui@users.noreply.github.com"
+          git add outputs
+          git commit -m "Save task outputs [skip ci]" || echo "No changes"
+          git push
